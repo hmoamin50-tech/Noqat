@@ -163,11 +163,9 @@ function generateReference() {
 function normalizeMemberNumber(input) {
   if (!input) return null;
   let s = String(input).trim().toUpperCase();
-  // إزالة كل الأحرف غير الأرقام والشرطات
   if (s.startsWith('NQ-')) {
     s = s.substring(3);
   }
-  // إزالة أي شرطات أو مسافات داخلية
   s = s.replace(/[^0-9]/g, '');
   if (s.length === 0) return null;
   return 'NQ-' + s;
@@ -669,6 +667,234 @@ app.get('/api/transactions/:id', authRequired, async (req, res, next) => {
     }
     res.json({ success: true, data: r.rows[0] });
   } catch (e) { next(e); }
+});
+
+// ==========================================
+// مسارات التوثيق (Documents / Verification)
+// ==========================================
+
+// 1. رفع مستند التوثيق
+app.post('/api/documents/upload', authRequired, async (req, res, next) => {
+  const { nationalId, fullName4, dateOfBirth, imageBase64 } = req.body || {};
+
+  if (!nationalId || !fullName4 || !dateOfBirth || !imageBase64) {
+    return res.status(400).json({ 
+      success: false, 
+      code: 'MISSING_FIELDS', 
+      message: 'جميع الحقول مطلوبة (الرقم الوطني، الاسم، تاريخ الميلاد، الصورة)' 
+    });
+  }
+
+  const cleanId = String(nationalId).replace(/\D/g, '');
+  if (cleanId.length !== 11) {
+    return res.status(400).json({ 
+      success: false, 
+      code: 'INVALID_NATIONAL_ID', 
+      message: 'الرقم الوطني يجب أن يتكون من 11 رقمًا' 
+    });
+  }
+
+  // التحقق من حجم الصورة (Base64)
+  if (imageBase64.length > 2 * 1024 * 1024) {
+    return res.status(413).json({ 
+      success: false, 
+      code: 'IMAGE_TOO_LARGE', 
+      message: 'حجم الصورة كبير جدًا' 
+    });
+  }
+
+  try {
+    const existing = await pool.query(
+      'SELECT id, status FROM documents WHERE user_id = $1',
+      [req.userId]
+    );
+
+    if (existing.rowCount > 0) {
+      const doc = existing.rows[0];
+      if (doc.status === 'pending' || doc.status === 'approved') {
+        return res.status(400).json({ 
+          success: false, 
+          code: 'ALREADY_SUBMITTED', 
+          message: doc.status === 'pending' ? 'طلبك قيد المراجعة بالفعل' : 'تم توثيق حسابك بالفعل' 
+        });
+      }
+      
+      await pool.query(
+        `UPDATE documents 
+         SET national_id = $1, full_name_4 = $2, date_of_birth = $3, image_data = $4, status = 'pending', rejection_reason = NULL, created_at = NOW()
+         WHERE user_id = $5`,
+        [cleanId, fullName4, dateOfBirth, imageBase64, req.userId]
+      );
+    } else {
+      await pool.query(
+        `INSERT INTO documents (user_id, national_id, full_name_4, date_of_birth, image_data, status)
+         VALUES ($1, $2, $3, $4, $5, 'pending')`,
+        [req.userId, cleanId, fullName4, dateOfBirth, imageBase64]
+      );
+    }
+
+    await pool.query(
+      `INSERT INTO audit_logs (actor_user_id, action, metadata)
+       VALUES ($1, 'document_upload', $2)`,
+      [req.userId, JSON.stringify({ nationalId: cleanId })]
+    );
+
+    res.json({ 
+      success: true, 
+      message: 'تم إرسال مستند التوثيق بنجاح، وهو الآن قيد المراجعة' 
+    });
+
+  } catch (e) {
+    next(e);
+  }
+});
+
+// 2. جلب حالة التوثيق للمستخدم الحالي
+app.get('/api/documents/status', authRequired, async (req, res, next) => {
+  try {
+    const r = await pool.query(
+      'SELECT status, rejection_reason, created_at FROM documents WHERE user_id = $1',
+      [req.userId]
+    );
+
+    if (r.rowCount === 0) {
+      return res.json({ success: true, data: null });
+    }
+
+    const doc = r.rows[0];
+    res.json({
+      success: true,
+      data: {
+        status: doc.status,
+        rejectionReason: doc.rejection_reason,
+        submittedAt: doc.created_at
+      }
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
+// 3. مسارات الأدمن لمراجعة المستندات
+app.get('/api/admin/documents/pending', authRequired, adminRequired, async (req, res, next) => {
+  try {
+    const r = await pool.query(
+      `SELECT d.id, d.national_id, d.full_name_4, d.date_of_birth, d.image_data, d.created_at,
+              u.username, u.member_number
+       FROM documents d
+       JOIN users u ON u.id = d.user_id
+       WHERE d.status = 'pending'
+       ORDER BY d.created_at ASC`
+    );
+    res.json({ success: true, data: r.rows });
+  } catch (e) {
+    next(e);
+  }
+});
+
+app.post('/api/admin/documents/:id/approve', authRequired, adminRequired, async (req, res, next) => {
+  const docId = parseInt(req.params.id, 10);
+  if (!Number.isFinite(docId)) {
+    return res.status(400).json({ success: false, code: 'INVALID_ID', message: 'معرف غير صالح' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const docR = await client.query(
+      'SELECT * FROM documents WHERE id = $1 AND status = $2 FOR UPDATE',
+      [docId, 'pending']
+    );
+
+    if (docR.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, code: 'DOC_NOT_FOUND', message: 'المستند غير موجود أو تمت مراجعته' });
+    }
+
+    const doc = docR.rows[0];
+
+    await client.query(
+      'UPDATE documents SET status = $1, reviewed_by = $2, reviewed_at = NOW() WHERE id = $3',
+      ['approved', req.userId, docId]
+    );
+
+    await client.query(
+      `UPDATE users 
+       SET is_verified = TRUE, national_id = $1, date_of_birth = $2, updated_at = NOW()
+       WHERE id = $3`,
+      [doc.national_id, doc.date_of_birth, doc.user_id]
+    );
+
+    await client.query(
+      `INSERT INTO audit_logs (actor_user_id, action, target_user_id, metadata)
+       VALUES ($1, 'document_approve', $2, $3)`,
+      [req.userId, doc.user_id, JSON.stringify({ documentId: docId })]
+    );
+
+    await client.query('COMMIT');
+    res.json({ success: true, message: 'تم توثيق المستخدم بنجاح' });
+
+  } catch (e) {
+    await client.query('ROLLBACK');
+    next(e);
+  } finally {
+    client.release();
+  }
+});
+
+app.post('/api/admin/documents/:id/reject', authRequired, adminRequired, async (req, res, next) => {
+  const docId = parseInt(req.params.id, 10);
+  const { reason } = req.body || {};
+
+  if (!Number.isFinite(docId)) {
+    return res.status(400).json({ success: false, code: 'INVALID_ID', message: 'معرف غير صالح' });
+  }
+  if (!reason || reason.trim().length === 0) {
+    return res.status(400).json({ success: false, code: 'MISSING_REASON', message: 'سبب الرفض مطلوب' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const docR = await client.query(
+      'SELECT * FROM documents WHERE id = $1 AND status = $2 FOR UPDATE',
+      [docId, 'pending']
+    );
+
+    if (docR.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, code: 'DOC_NOT_FOUND', message: 'المستند غير موجود أو تمت مراجعته' });
+    }
+
+    const doc = docR.rows[0];
+
+    await client.query(
+      'UPDATE documents SET status = $1, reviewed_by = $2, reviewed_at = NOW(), rejection_reason = $3 WHERE id = $4',
+      ['rejected', req.userId, reason.trim(), docId]
+    );
+
+    await client.query(
+      'UPDATE users SET is_verified = FALSE, updated_at = NOW() WHERE id = $1',
+      [doc.user_id]
+    );
+
+    await client.query(
+      `INSERT INTO audit_logs (actor_user_id, action, target_user_id, metadata)
+       VALUES ($1, 'document_reject', $2, $3)`,
+      [req.userId, doc.user_id, JSON.stringify({ documentId: docId, reason: reason.trim() })]
+    );
+
+    await client.query('COMMIT');
+    res.json({ success: true, message: 'تم رفض المستند' });
+
+  } catch (e) {
+    await client.query('ROLLBACK');
+    next(e);
+  } finally {
+    client.release();
+  }
 });
 
 // ---------- الأدمن: الشحن والخصم ----------
